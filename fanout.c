@@ -18,6 +18,7 @@
 #include <linux/slab.h>
 #include <linux/sched.h>
 #include <asm/uaccess.h>
+#include "fanout.h"
 
 
 /* Limits and other defines */
@@ -35,10 +36,18 @@ struct fo {
 	char *buf;		/* points to circular buffer, first char */
 	int indx;		/* where to put next char received */
 	loff_t count;		/* number chars received */
+	int readers_num;
+	int writers_num;
 	wait_queue_head_t inq;	/* readers wait on this queue */
 	struct semaphore sem;	/* lock to keep buf/indx sane */
 };
 
+struct fo_user {
+	struct fo *dev;
+	int fix;
+	int seek_set;
+	int seek_alignment;
+};
 
 /*  Function prototypes.  */
 int fanout_init_module(void);
@@ -48,10 +57,11 @@ static int fanout_release(struct inode *, struct file *);
 static ssize_t fanout_read(struct file *, char *, size_t, loff_t *);
 static ssize_t fanout_write(struct file *, const char *, size_t, loff_t *);
 static unsigned int fanout_poll(struct file *, poll_table *);
+static long fanout_ioctl(struct file *, unsigned int, unsigned long);
 
 
 /* Global variables */
-static int buffersize = 0x4000;	/* Size of the circular buffer 0x4000 16K */
+static int buffersize = 1048576;	/* Size of the circular buffer 1M */
 static unsigned int numberofdevs = NUM_FO_DEVS;
 static int fo_major = 0;	/* major device number */
 /* Debuglvl controls whether a printk is executed
@@ -80,6 +90,7 @@ static struct file_operations fanout_fops = {
 	.open = fanout_open,
 	.write = fanout_write,
 	.poll = fanout_poll,
+	.unlocked_ioctl = fanout_ioctl,
 	.release = fanout_release
 };
 
@@ -98,10 +109,13 @@ MODULE_PARM_DESC(numberofdevs,
 int fanout_init_module(void)
 {
 	int i, err;
+
+	buffersize = buffersize / 2 * 2;
+
 	fo_devs = kmalloc(numberofdevs * sizeof(struct fo), GFP_KERNEL);
 	if (fo_devs == NULL) {
 		if (debuglevel >= 1)
-			printk(KERN_ALERT "%s: init fails. no memory.\n",
+			printk(KERN_ALERT "%s: init fails: no memory\n",
 					DEVNAME);
 		return 0;
 	}
@@ -124,7 +138,7 @@ int fanout_init_module(void)
 	err = alloc_chrdev_region(&fo_devicenumber, 0, numberofdevs, DEVNAME);
 	if (err < 0) {
 		if (debuglevel >= 1)
-			printk(KERN_ALERT "%s: init fails. err=%d.\n",
+			printk(KERN_ALERT "%s: init fails: err=%d\n",
 				DEVNAME, err);
 		return err;
 	}
@@ -135,14 +149,14 @@ int fanout_init_module(void)
 	err = cdev_add(&fo_cdev, fo_devicenumber, numberofdevs);
 	if (err < 0) {
 		if (debuglevel >= 1)
-			printk(KERN_ALERT "%s: init fails. err=%d.\n",
+			printk(KERN_ALERT "%s: init fails: err=%d\n",
 					DEVNAME, err);
 		return err;
 	}
 
 	if (debuglevel >= 2) {
 		printk(KERN_INFO
-			"%s: Installed %d minor devices on major number %d.\n",
+			"%s: install %d minor devices on major number %d\n",
 		   			DEVNAME, numberofdevs, fo_major);
 	}
 	return 0;			/* success */
@@ -167,16 +181,18 @@ void fanout_exit_module(void)
 	unregister_chrdev_region(fo_devicenumber, numberofdevs);
 
 	if (debuglevel >= 2)
-		printk(KERN_INFO "%s: Uninstalled.\n", DEVNAME);
+		printk(KERN_INFO "%s: uninstalled\n", DEVNAME);
 }
-
 
 static int fanout_open(struct inode *inode, struct file *filp)
 {
 	int mnr = iminor(inode);
+	struct fo_user *usr;
 	struct fo *dev = &fo_devs[mnr];
-	if (debuglevel >= 3)
-		printk(KERN_DEBUG "%s open. Minor#=%d\n", DEVNAME, mnr);
+
+	if (debuglevel >= 3) {
+		printk(KERN_DEBUG "%s: dev=%d open\n", DEVNAME, mnr);
+	}
 
 	if (down_interruptible(&dev->sem))	/* prevent races on open */
 		return -ERESTARTSYS;
@@ -186,7 +202,7 @@ static int fanout_open(struct inode *inode, struct file *filp)
 		dev->buf = kmalloc(buffersize, GFP_KERNEL);
 		if (!dev->buf) {
 			if (debuglevel >= 1) {
-				printk(KERN_ALERT "%s: No memory dev=%d.\n",
+				printk(KERN_ALERT "%s: dev=%d open fails: no memory\n",
 						DEVNAME, mnr);
 			}
 			up(&dev->sem);	/* unlock sema */
@@ -194,61 +210,138 @@ static int fanout_open(struct inode *inode, struct file *filp)
 		}
 	}
 
-	/* store which fanout device in the file's private data */
-	filp->private_data = (void *) dev;
+	usr = kmalloc(sizeof(struct fo_user), GFP_KERNEL);
+	if (!usr) {
+		if (debuglevel >= 1) {
+			printk(KERN_ALERT "%s: dev=%d open fails: no memory\n",
+					DEVNAME, mnr);
+		}
+		up(&dev->sem);	/* unlock sema */
+		return -ENOMEM;
+	}
 
-	/* define the file to be immediately caught up with the fanout dev */
+	usr->dev = dev;
+	usr->fix = 0;
+	usr->seek_set = 0;
+	usr->seek_alignment = 0;
+
+	/* store which fanout device in the file's private data */
+	filp->private_data = usr;
+
 	filp->f_pos = dev->count;
+
+	if (filp->f_mode & FMODE_READ) {
+		dev->readers_num++;
+	}
+	if (filp->f_mode & FMODE_WRITE) {
+		dev->writers_num++;
+	}
+
 	up(&dev->sem);		/* unlock semaphore we are done */
+
 	return nonseekable_open(inode, filp);	/* success */
 }
 
 
 static int fanout_release(struct inode *inode, struct file *filp)
 {
-	if (debuglevel >= 3)
-		printk(KERN_DEBUG "%s close. Minor#=%d.\n", DEVNAME,
-			((struct fo *) filp->private_data)->minor);
+	struct fo_user *usr = filp->private_data;
+	struct fo *dev = usr->dev;
+
+	if (debuglevel >= 3) {
+		printk(KERN_DEBUG "%s: dev=%d close\n",
+				DEVNAME, dev->minor);
+	}
+
+	if (down_interruptible(&dev->sem))
+		return -ERESTARTSYS;
+
+	if (filp->f_mode & FMODE_READ) {
+		dev->readers_num--;
+	}
+	if (filp->f_mode & FMODE_WRITE) {
+		dev->writers_num--;
+	}
+
+	if (dev->readers_num <= 0 &&
+	    dev->writers_num <= 0) {
+		if (debuglevel >= 3) {
+			printk(KERN_DEBUG "%s: dev=%d reset\n",
+					DEVNAME, dev->minor);
+		}
+		dev->count = dev->indx = 0;
+	}
+
+	kfree(usr);
+
+	up(&dev->sem);
 
 	return 0;			/* success */
 }
 
 
-static ssize_t fanout_read(struct file *filp, char __user * buff,
-			   size_t count, loff_t * offset)
+static ssize_t fanout_read(
+	struct file *filp,
+	char __user * buff,
+	size_t count, loff_t * off)
 {
 	int ret;
 	loff_t xfer;		/* num bytes read from fanout buf */
 	int cpcnt, cpstrt;	/* cp count and start location */
-	struct fo *dev = (struct fo *) filp->private_data;
+	struct fo_user *usr = filp->private_data;
+	struct fo *dev = usr->dev;
 
 	if (down_interruptible(&dev->sem))	/* lock semaphore */
 		return -ERESTARTSYS;
 
-	if (debuglevel >= 3)
-		printk(KERN_DEBUG "%s: read %zu char from dev%d, off=%lld.\n",
-		   DEVNAME, count, dev->minor, *offset);
+	if (debuglevel >= 3) {
+		printk(KERN_DEBUG "%s: dev=%d read: count=%zu offset=%lld overall=%lld\n",
+				DEVNAME, dev->minor, count, *off, dev->count);
+	}
+
+	if (usr->fix)
+	{
+		loff_t offset;
+
+		usr->fix = 0;
+
+		if (usr->seek_set) {
+			if (dev->count > buffersize) {
+				offset = dev->count - buffersize;
+			} else {
+				offset = 0;
+			}
+		} else {
+			offset = dev->count;
+		}
+
+		if (usr->seek_alignment) {
+			offset = offset / 2 * 2;
+		}
+
+		*off = offset;
+	}
 
 	/* Wait here until new data is available */
-	while (*offset == dev->count) {
+	while (*off == dev->count) {
 		up(&dev->sem);		/* unlock sema */
-		if (wait_event_interruptible(dev->inq, (*offset != dev->count)))
+		if (wait_event_interruptible(dev->inq, (*off != dev->count)))
 			return -ERESTARTSYS;
 		if (down_interruptible(&dev->sem))	/* lock */
 			return -ERESTARTSYS;
 	}
 
 	/* Verify that data requested is in the buffer or is next byte */
-	xfer = dev->count - *offset;	/* send count minus requested pointer */
+	xfer = dev->count - *off;	/* send count minus requested pointer */
 	if ((xfer > (loff_t) buffersize) || (xfer < 0)) {
-		printk(KERN_DEBUG "%s: Overrun. xfer=%lld buffersize=%d",
-				 DEVNAME, xfer, buffersize);
+		printk(KERN_DEBUG "%s: dev=%d overrun: xfer=%lld buffersize=%d",
+				DEVNAME, dev->minor, xfer, buffersize);
 		up(&dev->sem);		/* unlock sema */
 		return -EPIPE;		/* buffer overrun */
 	}
 
 	/* Copy the new data out to the user */
-	xfer = dev->count - *offset;	/* amount of data available to copy */
+	xfer = dev->count - *off;	/* amount of data available to copy */
 
 	/* BUG: we need to check for a wrap on offset and count */
 
@@ -256,8 +349,8 @@ static ssize_t fanout_read(struct file *filp, char __user * buff,
 	xfer = ((loff_t)count < xfer) ? (loff_t)count : xfer;
 	ret = xfer;			/* we will handle these bytes */
 	while (xfer) {
-		/* copy start is where the reader last read (indx - (count - offset)) */
-		cpstrt = dev->indx - (dev->count - *offset);
+		/* copy start is where the reader last read (indx - (count - off)) */
+		cpstrt = dev->indx - (dev->count - *off);
 		if (cpstrt < 0) {	/* adjust copy count if needed */
 			cpcnt = ((loff_t)(-cpstrt) <  xfer) ? (loff_t)(-cpstrt) : xfer;
 			cpstrt += buffersize;
@@ -272,7 +365,12 @@ static ssize_t fanout_read(struct file *filp, char __user * buff,
 
 		buff += cpcnt;
 		xfer -= cpcnt;
-		*offset += cpcnt;
+		*off += cpcnt;
+	}
+
+	if (debuglevel >= 3) {
+		printk(KERN_DEBUG "%s: dev=%d ret: offset=%lld ret=%zd\n",
+				DEVNAME, dev->minor, *off, ret);
 	}
 
 	up(&dev->sem);		/* unlock sema */
@@ -286,19 +384,19 @@ static ssize_t fanout_write(
 	const char __user * buff,
 	size_t count, loff_t * off)
 {
-	struct fo *dev = filp->private_data;
-
 	int ret;
 	int xfer;			/* num bytes to read from user */
 	int cpcnt;		/* num bytes in a copy */
+	struct fo_user *usr = filp->private_data;
+	struct fo *dev = usr->dev;
 
 	if (down_interruptible(&dev->sem)) {	/* lock semaphore */
 		return -ERESTARTSYS;
 	}
 
 	if (debuglevel >= 3)
-		printk(KERN_DEBUG "%s: write %zu char to dev%d, off=%d.\n",
-		   DEVNAME, count, dev->minor, (int) *off);
+		printk(KERN_DEBUG "%s: dev=%d write: count=%zu offset=%lld\n",
+				DEVNAME, dev->minor, count, *off);
 
 	/* Copy at most one-quarter of the circular buffer size.  This
 	 * gives readers more of a chance to wake up and get some data 
@@ -313,10 +411,6 @@ static ssize_t fanout_write(
 	while (xfer) {
 		cpcnt = buffersize - dev->indx;
 		cpcnt = min(cpcnt, xfer);
-
-		if (debuglevel >= 3)
-			printk(KERN_DEBUG "%s: write copy from user(%p,%p,%d)\n",
-		   	DEVNAME, dev->buf + dev->indx, buff, cpcnt);
 
 		if (copy_from_user(dev->buf + dev->indx, buff, cpcnt)) {
 			up(&dev->sem);	/* unlock semaphore */
@@ -342,19 +436,87 @@ static unsigned int fanout_poll(struct file *filp, poll_table * ppt)
 {
 	/* The circular buffer is always available for writing */
 	int ready_mask = POLLOUT | POLLWRNORM;
+	struct fo_user *usr = filp->private_data;
+	struct fo *dev = usr->dev;
 
-	struct fo *dev = filp->private_data;
 	poll_wait(filp, &dev->inq, ppt);
 
 	if (filp->f_pos != dev->count) {
 		ready_mask = (POLLIN | POLLRDNORM);
 	}
 
-	if (debuglevel >= 3)
-		printk(KERN_DEBUG "%s: poll returns 0x%x\n",
-					DEVNAME, ready_mask);
+	if (debuglevel >= 3) {
+		printk(KERN_DEBUG "%s: dev=%d poll: ready_mask=0x%x\n",
+				DEVNAME, dev->minor, ready_mask);
+	}
 
 	return ready_mask;
+}
+
+static long fanout_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
+	long ret = 0;
+	struct fo_user *usr = filp->private_data;
+	struct fo *dev = usr->dev;
+
+	if (down_interruptible(&dev->sem)) {	/* lock semaphore */
+		return -ERESTARTSYS;
+	}
+
+	switch (cmd) {
+	case FANOUT_GET_RD:
+		if (copy_to_user((int __user *)arg,
+				&dev->readers_num, sizeof(int))) {
+			ret = -EFAULT;
+		} else {
+			if (debuglevel >= 3) {
+				printk(KERN_DEBUG "%s: dev=%d ioctl: readers_num=%d\n",
+						DEVNAME, dev->minor, dev->readers_num);
+			}
+		}
+		break;
+	case FANOUT_GET_WR:
+		if (copy_to_user((int __user *)arg,
+				&dev->writers_num, sizeof(int))) {
+			ret = -EFAULT;
+		} else {
+			if (debuglevel >= 3) {
+				printk(KERN_DEBUG "%s: dev=%d ioctl: writers_num=%d\n",
+						DEVNAME, dev->minor, dev->writers_num);
+			}
+		}
+		break;
+	case FANOUT_SET_SEEK_SET:
+		if (copy_from_user(&usr->seek_set,
+				(int __user *)arg, sizeof(int)))  {
+			ret = -EFAULT;
+		} else {
+			usr->fix = 1;
+			if (debuglevel >= 3) {
+				printk(KERN_DEBUG "%s: dev=%d ioctl: seek_set=%d\n",
+						DEVNAME, dev->minor, usr->seek_set);
+			}
+		}
+		break;
+	case FANOUT_SET_SEEK_ALIGNMENT:
+		if (copy_from_user(&usr->seek_alignment,
+				(int __user *)arg, sizeof(int))) {
+			ret = -EFAULT;
+		} else {
+			usr->fix = 1;
+			if (debuglevel >= 3) {
+				printk(KERN_DEBUG "%s: dev=%d ioctl: seek_alignment=%d\n",
+						DEVNAME, dev->minor, usr->seek_alignment);
+			}
+		}
+		break;
+	default:
+		ret = -EFAULT;
+		break;
+	}
+
+	up(&dev->sem);
+
+	return ret;
 }
 
 module_init(fanout_init_module);
